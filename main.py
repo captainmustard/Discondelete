@@ -4,161 +4,124 @@ import sys
 import argparse
 import re
 import time
+import tqdm
 
 # Set your defaults below, or specify with the respective arguments
-prefix = str("#DEL") 
-token = str("")
-heartbeat = int(86400)
-serverpurge =str("#PS") 
-nooutput = bool(True)
-MessagesToDEL = int()
-counter = int(0)
+prefix = "#DEL"
+token = ""
+heartbeat = 86400
+serverpurge = "#PS"
+nooutput = True
+count_before_delete = False
 
-def has_numbers(inputString):
-    return bool(re.search(r'\d', inputString))
+# Helper function to check if a string contains numbers
+def has_numbers(input_string):
+    return bool(re.search(r'\d', input_string))
 
 class MyClient(discord.Client):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.delay_between_deletions = 1.7  # Initial delay between deletions to avoid rate limits
+        self.deleted_count = 0  # Track number of deleted messages
+
     async def delete_message_safe(self, message):
         try:
             await message.delete()
+            self.deleted_count += 1  # Increment count after successful deletion
+            if not nooutput:
+                tqdm.tqdm.write(f"Deleted message: {message.content}")  # Output deleted message without interfering with progress bar
         except discord.errors.HTTPException as e:
             if e.status == 429:  # Rate limit error
                 retry_after = e.retry_after  # Discord tells us how long to wait
+                self.delay_between_deletions += 0.1  # Increase the delay between deletions by 0.1 seconds after each rate limit
+                retry_after = max(retry_after, self.delay_between_deletions)  # Ensure the delay doesn't go below the current delay between deletions
                 print(f"Rate limit hit. Retrying in {retry_after} seconds.")
                 await asyncio.sleep(retry_after)  # Wait for the retry_after time before proceeding
             else:
                 print(f"Error occurred: {e}")  # Handle other HTTP exceptions
 
     async def on_message(self, message):
-        if(message.author != self.user):
+        # Only process messages sent by the bot itself
+        if message.author != self.user:
             return
-        
+
         channels = []
-        containsnumbers = False
-        
-        if(message.content == serverpurge):
-            channels = message.channel.guild.channels
-        elif(prefix in message.content):  # Check if the prefix is present in the message
-            tmpStrConv = message.content.replace(prefix, '')
-            tmpStrConv = tmpStrConv.strip()
-            containsnumbers = has_numbers(tmpStrConv)
-            
-            if containsnumbers:
-                MessagesToDEL = int(str(tmpStrConv))
-            channels.append(message.channel)
+        contains_numbers = False
+        messages_to_del = None
+
+        # Check if the message is for server purge
+        if message.content == serverpurge:
+            # Get all channels and threads in the guild
+            channels = [channel for channel in message.channel.guild.channels if isinstance(channel, (discord.TextChannel, discord.Thread))]
+        elif prefix in message.content:  # Check if the prefix is present in the message
+            tmp_str_conv = message.content.replace(prefix, '').strip()  # Remove the prefix and strip whitespace
+            contains_numbers = has_numbers(tmp_str_conv)  # Check if the message contains a number
+
+            if contains_numbers:
+                messages_to_del = int(tmp_str_conv)  # Convert the number of messages to delete
+            channels.append(message.channel)  # Only operate in the current channel
         else:
             return
 
+        # Iterate over the identified channels and delete messages
         for channel in channels:
-            if nooutput == False:
-                print(channel)
-            
-            if containsnumbers:
-                try:
-                    async for mss in channel.history(limit=MessagesToDEL + 1):
-                        if mss.author == self.user:
-                            if nooutput == False:
-                                print(mss.content)
-                            try:
-                                await self.delete_message_safe(mss)
-                            except Exception as e:
-                                if nooutput == False:
-                                    print(f"Can't delete message due to: {e}")
-                            await asyncio.sleep(2)  # Add a 2-second delay between each deletion to avoid rate limits
-                except Exception as e:
-                    if nooutput == False:
-                        print(f"Can't read history due to: {e}")
-            else:
-                try:
-                    async for mss in channel.history(limit=None):
-                        if mss.author == self.user:
-                            if nooutput == False:
-                                print(mss.content)
-                            try:
-                                await self.delete_message_safe(mss)
-                            except Exception as e:
-                                if nooutput == False:
-                                    print(f"Can't delete message due to: {e}")
-                            await asyncio.sleep(2)  # Add a 2-second delay between each deletion to avoid rate limits
-                except Exception as e:
-                    if nooutput == False:
-                        print(f"Can't read history due to: {e}")
+            if not nooutput:
+                print(channel)  # Output channel info if nooutput is False
 
-# Create arguments
-parser = argparse.ArgumentParser(description='')
+            try:
+                # Count total messages if the user chose to count before deletion
+                total_messages = 0
+                if count_before_delete:
+                    print(f"Counting messages in channel {channel.name}... Please wait.")
+                    async for mss in channel.history(limit=messages_to_del + 1 if contains_numbers else None):
+                        if mss.author == self.user:
+                            total_messages += 1
+                    print(f"Total messages found in channel {channel.name}: {total_messages}")
+
+                # Now proceed to delete messages
+                limit = messages_to_del + 1 if contains_numbers else None  # Set limit if specified
+                progress_bar = tqdm.tqdm(total=total_messages, unit="msg", desc="Deleting messages") if count_before_delete else None
+                async for mss in channel.history(limit=limit):
+                    if mss.author == self.user:  # Only delete messages sent by the bot
+                        await self.delete_message_safe(mss)  # Attempt to delete the message
+                        await asyncio.sleep(self.delay_between_deletions)  # Add a delay between each deletion to avoid rate limits
+                        if progress_bar:
+                            progress_bar.update(1)  # Update the progress bar
+                            if progress_bar.n == progress_bar.total:
+                                progress_bar.n = progress_bar.total  # Ensure progress reaches 100%
+                if progress_bar:
+                    progress_bar.close()
+            except discord.Forbidden:
+                print(f"Permission denied for channel: {channel}")  # Handle forbidden error if lacking permissions
+            except discord.HTTPException as e:
+                print(f"HTTP error occurred: {e}")  # Handle other HTTP errors
+
+# Create arguments for command line input
+parser = argparse.ArgumentParser(description='Discord message purger')
 parser.add_argument('-t', '--token', dest='token', type=str, help='Token to use with message purger')
 parser.add_argument('-p', '--prefix', dest='prefix', type=str, help='Prefix to use with message purger')
 parser.add_argument('-s', '--serverpurge', dest='serverpurge', type=str, help='Specify a prefix to use for Server Purge')
 parser.add_argument('-b', '--heartbeat', dest='heartbeat', type=int, help='Heartbeat timeout to use')
 parser.add_argument('-o', '--output', action='store_true', help='Enable console output of deleted messages (Good for debugging)')
+parser.add_argument('-c', '--count', action='store_true', help='Count messages before deletion (Display progress bar and ETA)')
 args = parser.parse_args()
 
-# Token
-if args.token is not None:
-    token = args.token
+# Set values from arguments or prompts
+token = args.token or input("Please input a Token: ")
+prefix = args.prefix or input("Please input a prefix (leave blank for the default '#DEL'): ") or "#DEL"
+serverpurge = args.serverpurge or input("Please input a server purge prefix (leave blank for the default '#PS'): ") or "#PS"
+heartbeat = args.heartbeat or int(input("Please input a heartbeat timeout (leave blank for the default 86400): ") or 86400)
+nooutput = not args.output and input("Do you want to log console output? (Y/N): ").strip().lower() not in ["y", "yes"]
+count_before_delete = args.count or input("Do you want to count messages before deletion? (Y/N): ").strip().lower() in ["y", "yes"]
 
-# Prefix
-if args.prefix is not None:
-    prefix = args.prefix
+# Inform user about commands
+print(f"\nTo delete all messages in one channel, type: {prefix} in Discord, \nor delete a set amount of messages by adding a number after the prefix\n")
+print(f"To delete all messages from the server type: {serverpurge} in Discord.")
+if sys.platform.lower() in ["darwin"]:
+    print("\nTo stop the program, press " + u"\u2318" + " + C in the console.")
 else:
-    prefix = "#DEL"
+    print("\nTo stop the program, press CTRL + C in the console.")
 
-# Serverpurge prefix
-if args.serverpurge is not None:
-    serverpurge = args.serverpurge
-else:
-    serverpurge = "#PS"
-
-# Heartbeat
-if args.heartbeat is not None:
-    heartbeat = args.heartbeat
-else:
-    heartbeat = 86400
-
-# Output
-if args.output:
-    nooutput = False
-
-else:
-    token = input("Please input a Token: ")
-    # Prefix
-    if args.prefix is not None:
-        prefix = args.prefix
-    else:
-        prefix = input("Please input a prefix (leave blank for the default '#DEL'): ")
-        if prefix == "":
-            prefix = "#DEL"
-    # Serverpurge prefix
-    if args.serverpurge is not None:
-        serverpurge = args.serverpurge
-    else:
-        serverpurge = input("Please input a server purge prefix (leave blank for the default '#PS'): ")
-        if serverpurge == "":
-            serverpurge = "#PS"
-    # Heartbeat
-    if args.heartbeat is not None:
-        heartbeat = args.heartbeat
-    else:
-        heartbeat = input("Please input a heartbeat timeout (leave blank for the default 86400): ")
-        if heartbeat == "":
-            heartbeat = 86400
-    # Output
-    if args.output:
-        nooutput = False
-    else:
-        nop = input("Do you want to log console output? (Y/N): ")
-        if nop.lower() in ["", "n", "no"]:
-            nooutput = True
-        elif nop.lower() in ["y", "yes"]:
-            nooutput = False
-
-    print("\nTo delete all messages in one channel, type: " + prefix + " in Discord, \nor delete a set amount of messages by adding a number after the prefix\n")
-    print("To delete all messages from the server type: " + serverpurge + " in Discord.")
-    if sys.platform == "Darwin" or sys.platform == "darwin":
-        print("\nTo stop the program, press " + u"\u2318" + " + C in the console.")
-    else:
-        print("\nTo stop the program, press CTRL + C in the console.")
-
-# Run the self-bot and await prefix
-client = MyClient(heartbeat_timeout=heartbeat, guild_subscriptions=False)
+# Run the self-bot and await prefix commands
+client = MyClient(heartbeat_timeout=heartbeat, guild_subscriptions=False, chunk_guilds_at_startup=False)
 client.run(token)
